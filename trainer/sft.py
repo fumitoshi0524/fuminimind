@@ -42,16 +42,38 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
+        shift_labels = labels[..., 1:].contiguous()
+        valid_count = (shift_labels != -100).sum().item()
+        if valid_count == 0:
+            Logger(f"SFT invalid labels at step {step}: all shift labels masked")
+
+        if hasattr(lm_config, "vocab_size"):
+            max_id = int(input_ids.max().item())
+            min_id = int(input_ids.min().item())
+            if min_id < 0 or max_id >= lm_config.vocab_size:
+                Logger(
+                    f"SFT input_ids out of range at step {step}: min={min_id}, max={max_id}, vocab_size={lm_config.vocab_size}"
+                )
+                raise RuntimeError("SFT input_ids out of range")
+
         with autocast_ctx:
             res = model(input_ids)
             logits = res.logits
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                Logger(f"SFT logits NaN/Inf at step {step}")
+                raise RuntimeError("SFT logits NaN/Inf")
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
             loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
             loss = loss / args.accumulation_steps
+
+        if not torch.isfinite(loss):
+            Logger(
+                f"SFT loss NaN/Inf at step {step}: valid_count={valid_count}, logits_min={logits.min().item():.6f}, logits_max={logits.max().item():.6f}"
+            )
+            raise RuntimeError("SFT loss NaN/Inf")
 
         scaler.scale(loss).backward()
 
