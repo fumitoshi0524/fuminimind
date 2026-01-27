@@ -1,7 +1,6 @@
 import os
 import sys
 
-
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -15,9 +14,9 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
-from model.model import fuminimindConfig 
-from dataset.lm_dataset import PretrainingDataset 
-from trainer.train_utils import (  
+from model.model import fuminimindConfig
+from dataset.lm_dataset import SFTDataset
+from trainer.train_utils import (
     get_lr,
     Logger,
     is_main_process,
@@ -30,65 +29,57 @@ from trainer.train_utils import (
 
 warnings.filterwarnings("ignore")
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    loss_fct = nn.CrossEntropyLoss(reduction="none")
-    start_time = time.time() 
 
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="mean")
+    start_time = time.time()
+
+    for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
         with autocast_ctx:
-            res = model(X)
-
-            loss = loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size()) 
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-            
+            res = model(input_ids)
+            logits = res.logits
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
             scaler.step(optimizer)
             scaler.update()
-
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps  
-            current_lr = optimizer.param_groups[-1]["lr"]  
-            
+            current_loss = loss.item() * args.accumulation_steps
+            current_lr = optimizer.param_groups[-1]["lr"]
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-
             Logger(
                 f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
             )
-
             if wandb:
-                wandb.log(
-                    {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
-                )
+                wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
-            model.eval() 
-
+            model.eval()
             moe_suffix = (
                 "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
             )
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
-           
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
@@ -109,21 +100,16 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 save_dir="checkpoints",
             )
 
-            model.train()  
+            model.train()
 
 
 def get_parser():
-    parser = argparse.ArgumentParser(description="fuminimind Pretraining")
+    parser = argparse.ArgumentParser(description="fuminimind Full SFT")
     parser.add_argument("--save_dir", type=str, default="out", help="path to save the model")
-    parser.add_argument("--save_weight", default="pretrain", type=str, help="prefix for saving weights")
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=1,
-        help="number of training epochs (recommended 1 epoch for zero or 2-6 epochs for full training)",
-    )
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=5e-4, help="initial learning rate")
+    parser.add_argument("--save_weight", default="full_sft", type=str, help="prefix for saving weights")
+    parser.add_argument("--epochs", type=int, default=2, help="number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
+    parser.add_argument("--learning_rate", type=float, default=1e-6, help="initial learning rate")
     parser.add_argument(
         "--device",
         type=str,
@@ -131,16 +117,14 @@ def get_parser():
         help="training device",
     )
     parser.add_argument("--dtype", type=str, default="bfloat16", help="mixed precision type")
-    parser.add_argument("--num_workers", type=int, default=1, help="number of data loading workers")
-    parser.add_argument("--accumulation_steps", type=int, default=8, help="gradient accumulation steps")
+    parser.add_argument("--num_workers", type=int, default=8, help="number of data loading workers")
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="gradient accumulation steps")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="gradient clipping threshold")
     parser.add_argument("--log_interval", type=int, default=100, help="log printing interval")
-    parser.add_argument("--save_interval", type=int, default=100, help="model saving interval")
+    parser.add_argument("--save_interval", type=int, default=1000, help="model saving interval")
     parser.add_argument("--hidden_size", default=512, type=int, help="hidden layer dimension")
     parser.add_argument("--num_hidden_layers", default=8, type=int, help="number of hidden layers")
-    parser.add_argument(
-        "--max_seq_len", default=512, type=int, help="maximum sequence length for training"
-    )
+    parser.add_argument("--max_seq_len", default=512, type=int, help="maximum sequence length for training")
     parser.add_argument(
         "--use_moe",
         default=0,
@@ -151,12 +135,12 @@ def get_parser():
     parser.add_argument(
         "--data_path",
         type=str,
-        default="dataset/pretrain_hq.jsonl",
-        help="pretraining data path",
+        default="dataset/sft.jsonl",
+        help="sft data path",
     )
     parser.add_argument(
         "--from_weight",
-        default="none",
+        default="pretrain",
         type=str,
         help="which weight to train from, 'none' means training from scratch",
     )
@@ -169,7 +153,7 @@ def get_parser():
     )
     parser.add_argument("--use_wandb", action="store_true", help="whether to use wandb")
     parser.add_argument(
-        "--wandb_project", type=str, default="fuminimind-Pretrain", help="wandb project name"
+        "--wandb_project", type=str, default="fuminimind-Full-SFT", help="wandb project name"
     )
     return parser
 
@@ -209,14 +193,12 @@ def run(parsed_args):
         wandb_id = ckp_data.get("wandb_id") if ckp_data else None
         resume = "must" if wandb_id else None
         wandb_run_name = (
-            f"fuminimind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+            f"fuminimind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         )
-        wandb.init(
-            project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume
-        )
+        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
 
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    train_ds = PretrainingDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
