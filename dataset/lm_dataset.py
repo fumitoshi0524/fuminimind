@@ -75,13 +75,17 @@ class SFTDataset(Dataset):
             if len(messages) >= 1 and messages[-1].get("role") == "assistant":
                 response = messages[-1].get("content", "")
                 prompt_messages = messages[:-1]
+                prompt = None
                 if hasattr(self.tokenizer, "apply_chat_template"):
-                    prompt = self.tokenizer.apply_chat_template(
-                        prompt_messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                else:
+                    try:
+                        prompt = self.tokenizer.apply_chat_template(
+                            prompt_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                    except ValueError:
+                        prompt = None
+                if prompt is None:
                     prompt = "".join(
                         f"{m.get('role','user')}: {m.get('content','')}\n"
                         for m in prompt_messages
@@ -96,13 +100,22 @@ class SFTDataset(Dataset):
             if len(messages) >= 1 and messages[-1].get("role") == "assistant":
                 response = messages[-1].get("content", "")
                 prompt_messages = messages[:-1]
+                prompt = None
                 if hasattr(self.tokenizer, "apply_chat_template"):
-                    prompt = self.tokenizer.apply_chat_template(
-                        prompt_messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
+                    try:
+                        prompt = self.tokenizer.apply_chat_template(
+                            prompt_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                    except ValueError:
+                        prompt = None
+                if prompt is None:
+                    prompt = "".join(
+                        f"{m.get('role','user')}: {m.get('content','')}\n"
+                        for m in prompt_messages
                     )
-                    return prompt, response
+                return prompt, response
         text = str(sample.get("text", ""))
         return text, ""
 
