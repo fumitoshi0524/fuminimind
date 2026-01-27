@@ -89,8 +89,7 @@ class SFTDataset(Dataset):
         text = str(sample.get("text", ""))
         return text, ""
 
-    def __getitem__(self, index):
-        sample = self.samples[index]
+    def _encode_sample(self, sample):
         prompt, response = self._build_prompt_response(sample)
 
         if response:
@@ -118,5 +117,17 @@ class SFTDataset(Dataset):
             labels[:prompt_len] = -100
 
         labels[input_ids == self.tokenizer.pad_token_id] = -100
+        valid_count = (labels != -100).sum().item()
+        return input_ids, labels, valid_count
+
+    def __getitem__(self, index):
+        tries = 0
+        while tries < 8:
+            sample = self.samples[index]
+            input_ids, labels, valid_count = self._encode_sample(sample)
+            if valid_count > 0:
+                return input_ids, labels
+            index = (index + 1) % len(self.samples)
+            tries += 1
 
         return input_ids, labels
