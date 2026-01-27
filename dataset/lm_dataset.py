@@ -70,6 +70,23 @@ class SFTDataset(Dataset):
         return len(self.samples)
 
     def _build_prompt_response(self, sample):
+        if "conversations" in sample and isinstance(sample["conversations"], list):
+            messages = sample["conversations"]
+            if len(messages) >= 1 and messages[-1].get("role") == "assistant":
+                response = messages[-1].get("content", "")
+                prompt_messages = messages[:-1]
+                if hasattr(self.tokenizer, "apply_chat_template"):
+                    prompt = self.tokenizer.apply_chat_template(
+                        prompt_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                else:
+                    prompt = "".join(
+                        f"{m.get('role','user')}: {m.get('content','')}\n"
+                        for m in prompt_messages
+                    )
+                return prompt, response
         if "prompt" in sample and "response" in sample:
             return sample["prompt"], sample["response"]
         if "instruction" in sample and "output" in sample:
