@@ -146,7 +146,7 @@ def get_parser():
     )
     parser.add_argument(
         "--use_moe",
-        default=0,
+        default=1,
         type=int,
         choices=[0, 1],
         help="whether to use MoE architecture (0=no, 1=yes)",
@@ -190,7 +190,7 @@ def run(parsed_args):
     lm_config = fuminimindConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
-        use_moe=bool(args.use_moe),
+        use_moe=True,
     )
 
     ckp_data = (
