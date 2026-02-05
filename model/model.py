@@ -145,7 +145,12 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         return x
     
     return x[:, :, :, None, :].expand(b, t, n, n_rep, hd).reshape(b, t, n * n_rep, hd)
-    
+
+def _ensure_intermediate_size(config: fuminimindConfig):
+    if config.intermediate_size is None:
+        intermediate_size = int(config.hidden_size * 8/3)
+        config.intermediate_size = ((intermediate_size + 64 -1)//64) * 64
+
 class Attention(nn.Module):
     def __init__(self, config: fuminimindConfig):
         super().__init__()
@@ -163,8 +168,8 @@ class Attention(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
 
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
 
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
 
@@ -242,14 +247,10 @@ class Attention(nn.Module):
 
         return output, past_kv
 
-class FeedForward(nn.Module):
+class FFNExpert(nn.Module):
     def __init__(self, config: fuminimindConfig):
         super().__init__()
-
-        if config.intermediate_size is None:
-            intermediate_size = int(config.hidden_size * 8/3)
-            config.intermediate_size = ((intermediate_size + 64 -1)//64) * 64
-        
+        _ensure_intermediate_size(config)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -259,7 +260,98 @@ class FeedForward(nn.Module):
     def forward(self, x):
         g = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(g))
-    
+
+class MoEFeedForward(nn.Module):
+    def __init__(self, config: fuminimindConfig):
+        super().__init__()
+        _ensure_intermediate_size(config)
+
+        self.hidden_size = config.hidden_size
+        self.n_routed_experts = config.n_routed_experts
+        self.n_shared_experts = config.n_shared_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.scoring_func = config.scoring_func
+        self.seq_aux = config.seq_aux
+        self.norm_topk_prob = config.norm_topk_prob
+
+        self.router = nn.Linear(config.hidden_size, self.n_routed_experts, bias=False)
+        self.routed_experts = nn.ModuleList(
+            [FFNExpert(config) for _ in range(self.n_routed_experts)]
+        )
+        self.shared_experts = nn.ModuleList(
+            [FFNExpert(config) for _ in range(self.n_shared_experts)]
+        )
+
+    def _router_probs(self, x_flat):
+        if self.scoring_func == "softmax":
+            return F.softmax(self.router(x_flat), dim=-1)
+        if self.scoring_func == "sigmoid":
+            probs = torch.sigmoid(self.router(x_flat))
+            return probs / (probs.sum(dim=-1, keepdim=True) + 1e-9)
+        raise ValueError(f"Unsupported scoring_func: {self.scoring_func}")
+
+    def _aux_loss(self, probs, topk_idx, bsz, seq_len):
+        n = probs.size(-1)
+
+        def _single_aux(p, idx):
+            tokens = p.size(0)
+            importance = p.sum(dim=0)
+            load = torch.zeros_like(importance)
+            load.scatter_add_(0, idx.reshape(-1), torch.ones_like(idx.reshape(-1), dtype=importance.dtype))
+            return n * torch.sum(importance * load) / (tokens * tokens + 1e-9)
+
+        if self.seq_aux:
+            probs_b = probs.view(bsz, seq_len, n)
+            topk_b = topk_idx.view(bsz, seq_len, -1)
+            aux = 0.0
+            for i in range(bsz):
+                aux = aux + _single_aux(probs_b[i], topk_b[i])
+            return aux / bsz
+        return _single_aux(probs, topk_idx)
+
+    def forward(self, x):
+        bsz, seq_len, _ = x.shape
+        x_flat = x.view(-1, self.hidden_size)
+
+        probs = self._router_probs(x_flat)
+        topk_probs, topk_idx = torch.topk(probs, self.num_experts_per_tok, dim=-1)
+        if self.norm_topk_prob:
+            topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-9)
+
+        out = torch.zeros_like(x_flat)
+
+        for expert_id, expert in enumerate(self.routed_experts):
+            mask = topk_idx == expert_id
+            if not mask.any():
+                continue
+            token_idx, kth = mask.nonzero(as_tuple=True)
+            expert_in = x_flat[token_idx]
+            expert_out = expert(expert_in)
+            out[token_idx] += expert_out * topk_probs[token_idx, kth].unsqueeze(-1)
+
+        if self.n_shared_experts > 0:
+            shared_out = 0.0
+            for expert in self.shared_experts:
+                shared_out = shared_out + expert(x_flat)
+            out = out + shared_out / self.n_shared_experts
+
+        aux_loss = self._aux_loss(probs, topk_idx, bsz, seq_len)
+        return out.view(bsz, seq_len, -1), aux_loss
+
+class FeedForward(nn.Module):
+    def __init__(self, config: fuminimindConfig):
+        super().__init__()
+        _ensure_intermediate_size(config)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        g = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(g))
+
 class fuminimindLayer(nn.Module):
     def __init__(self, layer_id: int, config: fuminimindConfig):
         super().__init__()
@@ -271,7 +363,7 @@ class fuminimindLayer(nn.Module):
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config)
+        self.mlp = MoEFeedForward(config)
 
     def forward(self, hidden_states, position_embedding, past_key_value=None, 
                 use_cache=False, attention_mask=None):
@@ -286,10 +378,11 @@ class fuminimindLayer(nn.Module):
         )
 
         hidden_states = residual + hidden_states
-        hidden_states = hidden_states + self.mlp(
+        ffn_out, aux_loss = self.mlp(
             self.post_attention_layernorm(hidden_states)
         )
-        return hidden_states, present_key_value
+        hidden_states = hidden_states + ffn_out
+        return hidden_states, present_key_value, aux_loss
 
 class fuminimindModel(nn.Module):
     def __init__(self, config: fuminimindConfig):
@@ -349,9 +442,10 @@ class fuminimindModel(nn.Module):
         )
 
         presents = []
+        aux_loss_total = 0.0
 
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
-            hidden_states, present = layer(
+            hidden_states, present, aux_loss = layer(
                 hidden_states,
                 positive_embeddings,
                 past_key_value=past_key_value,
@@ -359,10 +453,12 @@ class fuminimindModel(nn.Module):
                 attention_mask=attention_mask,
             )
             presents.append(present)
+            aux_loss_total = aux_loss_total + aux_loss
 
+        aux_loss_total = aux_loss_total / len(self.layers)
         hidden_states = self.norm(hidden_states)
-        return hidden_states, presents
-    
+        return hidden_states, presents, aux_loss_total
+
 class fuminimindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = fuminimindConfig
 
@@ -384,7 +480,7 @@ class fuminimindForCausalLM(PreTrainedModel, GenerationMixin):
                 logits_to_keep:Union[int, torch.Tensor] = 0,
                 **args):
         
-        hidden_states, past_key_values = self.model(
+        hidden_states, past_key_values, aux_loss = self.model(
             input_ids = input_ids,
             attention_mask = attention_mask,
             past_key_values = past_key_values,
@@ -399,8 +495,10 @@ class fuminimindForCausalLM(PreTrainedModel, GenerationMixin):
 
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
             logits = logits,
             past_key_values = past_key_values,
             hidden_states = hidden_states
         )
+        output.aux_loss = aux_loss
+        return output

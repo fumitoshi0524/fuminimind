@@ -49,6 +49,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
             loss = loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size()) 
             loss = (loss * loss_mask).sum() / loss_mask.sum()
+
+            if hasattr(res, "aux_loss") and res.aux_loss is not None:
+                loss = loss + lm_config.aux_loss_alpha * res.aux_loss
             
             loss = loss / args.accumulation_steps
 

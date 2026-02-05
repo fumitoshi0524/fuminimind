@@ -51,6 +51,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
+
+            if hasattr(res, "aux_loss") and res.aux_loss is not None:
+                loss = loss + lm_config.aux_loss_alpha * res.aux_loss
+
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
