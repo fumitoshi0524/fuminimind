@@ -5,24 +5,9 @@ import warnings
 import torch
 import os
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from transformers import StoppingCriteria, StoppingCriteriaList
 from model.model import fuminimindConfig, fuminimindForCausalLM
 from trainer.train_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
-
-
-class StopOnSubsequence(StoppingCriteria):
-    def __init__(self, stop_sequences):
-        super().__init__()
-        self.stop_sequences = [s for s in stop_sequences if s]
-
-    def __call__(self, input_ids, scores, **kwargs):
-        seq = input_ids[0].tolist()
-        for stop in self.stop_sequences:
-            if len(seq) >= len(stop) and seq[-len(stop):] == stop:
-                return True
-        return False
-
 
 def init_model(args):
     try:
@@ -58,7 +43,6 @@ def init_model(args):
     get_model_params(model, model.config)
     return model.eval().to(args.device), tokenizer
 
-
 def main():
     parser = argparse.ArgumentParser(description="fuminimind模型推理与对话")
     parser.add_argument('--load_from', default='model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")
@@ -80,7 +64,7 @@ def main():
     parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
-
+    
     prompts = [
         '你有什么特长？',
         '为什么天空是蓝色的',
@@ -91,26 +75,16 @@ def main():
         '解释什么是机器学习',
         '推荐一些中国的美食'
     ]
-
+    
     conversation = []
     model, tokenizer = init_model(args)
     input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-
-    stop_sequences = []
-    for s in ["<|im_end|>", tokenizer.eos_token, "\nuser:", "\n用户:"]:
-        if s:
-            ids = tokenizer.encode(s, add_special_tokens=False)
-            if ids:
-                stop_sequences.append(ids)
-
-    stopper = StoppingCriteriaList([StopOnSubsequence(stop_sequences)])
-
+    
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
     for prompt in prompt_iter:
-        setup_seed(2026)  # or setup_seed(random.randint(0, 2048))
-        if input_mode == 0:
-            print(f'💬: {prompt}')
+        setup_seed(2026) # or setup_seed(random.randint(0, 2048))
+        if input_mode == 0: print(f'💬: {prompt}')
         conversation = conversation[-args.historys:] if args.historys else []
         conversation.append({"role": "user", "content": prompt})
 
@@ -147,13 +121,11 @@ def main():
             top_p=args.top_p, top_k=args.top_k, temperature=args.temperature,
             repetition_penalty=args.repetition_penalty,
             no_repeat_ngram_size=args.no_repeat_ngram_size,
-            stopping_criteria=stopper,
         )
         response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
         conversation.append({"role": "assistant", "content": response})
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
         print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
-
 
 if __name__ == "__main__":
     main()
