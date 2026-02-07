@@ -31,7 +31,6 @@ warnings.filterwarnings("ignore")
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="mean")
     start_time = time.time()
 
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
@@ -43,18 +42,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             param_group["lr"] = lr
 
         with autocast_ctx:
-            res = model(input_ids)
-            logits = res.logits
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            )
-
-            if hasattr(res, "aux_loss") and res.aux_loss is not None:
-                loss = loss + lm_config.aux_loss_alpha * res.aux_loss
-
+            res = model(input_ids, labels=labels)
+            loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -69,42 +58,30 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
+            current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]["lr"]
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
             Logger(
-                f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
+                f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min"
             )
             if wandb:
-                wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
+                wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
-            moe_suffix = (
-                "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
-            )
+            moe_suffix = "_moe" if lm_config.use_moe else ""
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
-
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
-
-            state_dict = {k: v.half() for k, v in state_dict.items()}
-            torch.save(state_dict, ckp)
-
-            lm_checkpoint(
-                lm_config,
-                weight=args.save_weight,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-                step=step,
-                wandb=wandb,
-                save_dir="checkpoints",
-            )
-
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = getattr(raw_model, "_orig_mod", raw_model)
+            state_dict = raw_model.state_dict()
+            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
+                         epoch=epoch, step=step, wandb=wandb, save_dir="checkpoints", scaler=scaler)
             model.train()
+            del state_dict
+
+        del input_ids, labels, res, loss
 
 
 def get_parser():
@@ -128,10 +105,10 @@ def get_parser():
     parser.add_argument("--save_interval", type=int, default=1000, help="model saving interval")
     parser.add_argument("--hidden_size", default=512, type=int, help="hidden layer dimension")
     parser.add_argument("--num_hidden_layers", default=8, type=int, help="number of hidden layers")
-    parser.add_argument("--max_seq_len", default=512, type=int, help="maximum sequence length for training")
+    parser.add_argument("--max_seq_len", default=340, type=int, help="maximum sequence length for training")
     parser.add_argument(
         "--use_moe",
-        default=1,
+        default=0,
         type=int,
         choices=[0, 1],
         help="whether to use MoE architecture (0=no, 1=yes)",
@@ -139,7 +116,7 @@ def get_parser():
     parser.add_argument(
         "--data_path",
         type=str,
-        default="dataset/sft.jsonl",
+        default="dataset/sft_mini_512.jsonl",
         help="sft data path",
     )
     parser.add_argument(
@@ -159,6 +136,7 @@ def get_parser():
     parser.add_argument(
         "--wandb_project", type=str, default="fuminimind-Full-SFT", help="wandb project name"
     )
+    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="whether to use torch.compile (0=no, 1=yes)")
     return parser
 
 
@@ -175,7 +153,7 @@ def run(parsed_args):
     lm_config = fuminimindConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
-        use_moe=True,
+        use_moe=bool(args.use_moe),
     )
 
     ckp_data = (
@@ -202,6 +180,9 @@ def run(parsed_args):
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
 
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    if args.use_compile == 1:
+        model = torch.compile(model)
+        Logger("torch.compile enabled")
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
@@ -220,32 +201,16 @@ def run(parsed_args):
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
     for epoch in range(start_epoch, args.epochs):
-        if train_sampler:
-            train_sampler.set_epoch(epoch)
-
-        if epoch == start_epoch and start_step > 0:
-            batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step + 1
-            )
-            loader = DataLoader(
-                train_ds,
-                batch_sampler=batch_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            Logger(
-                f"Epoch [{epoch + 1}/{args.epochs}]: skip first {start_step} steps, starting from step {start_step + 1}"
-            )
-            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
+        train_sampler and train_sampler.set_epoch(epoch)
+        setup_seed(42 + epoch)
+        indices = torch.randperm(len(train_ds)).tolist()
+        skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        if skip > 0:
+            Logger(f"Epoch [{epoch + 1}/{args.epochs}]: skip first {start_step} steps, starting from step {start_step + 1}")
+            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
-            loader = DataLoader(
-                train_ds,
-                batch_size=args.batch_size,
-                shuffle=(train_sampler is None),
-                sampler=train_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
             train_epoch(epoch, loader, len(loader), 0, wandb)
 
 

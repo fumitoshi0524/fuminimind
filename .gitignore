@@ -11,3 +11,4 @@ wheels/
 out/
 *.jsonl
 checkpoints/
+exclude
