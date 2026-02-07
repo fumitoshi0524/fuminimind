@@ -67,11 +67,18 @@ class SFTDataset(Dataset):
     def create_chat_prompt(self, conversations):
         messages = conversations.copy()
         tools = conversations[0]["functions"] if (conversations and conversations[0]["role"] == "system" and conversations[0].get("functions")) else None
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-            tools=tools,
+        if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    tools=tools,
+                )
+            except ValueError:
+                pass
+        return "".join(
+            f"{m.get('role','user')}: {m.get('content','')}\n" for m in messages
         )
 
     def generate_labels(self, input_ids):
